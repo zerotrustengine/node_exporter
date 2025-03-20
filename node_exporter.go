@@ -1,21 +1,9 @@
-// Copyright 2015 The Prometheus Authors
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package main
 
 import (
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -23,6 +11,7 @@ import (
 	"runtime"
 	"slices"
 	"sort"
+	"strings"
 
 	"github.com/prometheus/common/promslog"
 	"github.com/prometheus/common/promslog/flag"
@@ -178,6 +167,55 @@ func (h *handler) innerHandler(filters ...string) (http.Handler, error) {
 	return handler, nil
 }
 
+// ipRestrictMiddleware creates a middleware that checks if the client's IP
+// is in the allowlist before serving the request
+func ipRestrictMiddleware(next http.Handler, allowedIPs []string, logger *slog.Logger) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// If no IPs are specified, allow all access
+		if len(allowedIPs) == 0 {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Get client IP from request
+		ip, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			// If cannot parse address, use the RemoteAddr directly
+			ip = r.RemoteAddr
+		}
+
+		// Check if client IP is in the allowlist
+		allowed := false
+		for _, allowedIP := range allowedIPs {
+			// Check for exact IP match or CIDR match
+			if allowedIP == ip {
+				allowed = true
+				break
+			}
+
+			// Try to parse as CIDR
+			if strings.Contains(allowedIP, "/") {
+				_, ipNet, err := net.ParseCIDR(allowedIP)
+				if err == nil {
+					clientIP := net.ParseIP(ip)
+					if clientIP != nil && ipNet.Contains(clientIP) {
+						allowed = true
+						break
+					}
+				}
+			}
+		}
+
+		if allowed {
+			logger.Debug("Access allowed", "ip", ip)
+			next.ServeHTTP(w, r)
+		} else {
+			logger.Warn("Access denied", "ip", ip)
+			http.Error(w, "Access denied,please use to start node_exporter --web.allow-ips=[ip]", http.StatusForbidden)
+		}
+	})
+}
+
 func main() {
 	var (
 		metricsPath = kingpin.Flag(
@@ -199,6 +237,10 @@ func main() {
 		maxProcs = kingpin.Flag(
 			"runtime.gomaxprocs", "The target number of CPUs Go will run on (GOMAXPROCS)",
 		).Envar("GOMAXPROCS").Default("1").Int()
+		allowedIPs = kingpin.Flag(
+			"web.allow-ips",
+			"Comma-separated list of IP addresses or CIDR ranges allowed to access the exporter. Empty means allow all.",
+		).Default("").String()
 		toolkitFlags = kingpinflag.AddFlags(kingpin.CommandLine, ":9100")
 	)
 
@@ -221,7 +263,22 @@ func main() {
 	runtime.GOMAXPROCS(*maxProcs)
 	logger.Debug("Go MAXPROCS", "procs", runtime.GOMAXPROCS(0))
 
-	http.Handle(*metricsPath, newHandler(!*disableExporterMetrics, *maxRequests, logger))
+	// Parse allowed IP addresses
+	var allowlist []string
+	if *allowedIPs != "" {
+		allowlist = strings.Split(*allowedIPs, ",")
+		for i, ip := range allowlist {
+			allowlist[i] = strings.TrimSpace(ip)
+		}
+		logger.Info("IP restriction enabled", "allowed_ips", allowlist)
+	} else {
+		logger.Info("IP restriction disabled, all IPs allowed")
+	}
+
+	// Set up the handlers with IP restriction middleware
+	metricsHandler := newHandler(!*disableExporterMetrics, *maxRequests, logger)
+	http.Handle(*metricsPath, ipRestrictMiddleware(metricsHandler, allowlist, logger))
+
 	if *metricsPath != "/" {
 		landingConfig := web.LandingConfig{
 			Name:        "Node Exporter",
@@ -239,7 +296,8 @@ func main() {
 			logger.Error(err.Error())
 			os.Exit(1)
 		}
-		http.Handle("/", landingPage)
+		// Apply IP restriction to the landing page too
+		http.Handle("/", ipRestrictMiddleware(landingPage, allowlist, logger))
 	}
 
 	server := &http.Server{}

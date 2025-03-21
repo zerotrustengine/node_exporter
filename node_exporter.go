@@ -5,7 +5,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	_ "net/http/pprof"
 	"os"
 	"os/user"
 	"runtime"
@@ -211,7 +210,23 @@ func ipRestrictMiddleware(next http.Handler, allowedIPs []string, logger *slog.L
 			next.ServeHTTP(w, r)
 		} else {
 			logger.Warn("Access denied", "ip", ip)
-			http.Error(w, "Access denied,please use to start node_exporter --web.allow-ips=[ip]", http.StatusForbidden)
+
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				http.Error(w, "Webserver doesn't support hijacking", http.StatusInternalServerError)
+				return
+			}
+
+			// 获取底层连接
+			conn, _, err := hj.Hijack()
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			defer conn.Close()
+
+			// 直接关闭连接
+			conn.Close()
 		}
 	})
 }
